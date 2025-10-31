@@ -1,0 +1,476 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NBA Analysis Full App</title>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script crossorigin src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+  <script crossorigin src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 2rem; }
+      input, button, select { padding: 0.5rem; margin-right: 0.5rem; }
+      pre { background: #f4f4f4; padding: 1rem; border-radius: 4px; max-height: 400px; overflow-y: auto; }
+      .chart-container { width: 100%; max-width: 600px; margin-top: 1rem; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script>
+      // Surface runtime JS errors visibly to help diagnose white screen
+      window.addEventListener('error', function (e) {
+        try {
+          const pre = document.createElement('pre');
+          pre.style.background = '#ffefef';
+          pre.style.color = '#b00020';
+          pre.style.padding = '8px';
+          pre.style.border = '1px solid #b00020';
+          pre.textContent = 'Błąd JS: ' + (e.error?.message || e.message);
+          document.body.prepend(pre);
+        } catch (_) {}
+      });
+      // Promise rejection handler
+      window.addEventListener('unhandledrejection', function (e) {
+        try {
+          const pre = document.createElement('pre');
+          pre.style.background = '#ffefef';
+          pre.style.color = '#b00020';
+          pre.style.padding = '8px';
+          pre.style.border = '1px solid #b00020';
+          pre.textContent = 'Unhandled promise rejection: ' + (e.reason?.message || String(e.reason));
+          document.body.prepend(pre);
+        } catch (_) {}
+      });
+    </script>
+    <!-- Hardcoded Supabase public config (as requested) -->
+    <script>
+      window.NEXT_PUBLIC_SUPABASE_URL = 'https://oabavppelihkpoubgoiq.supabase.co';
+      window.NEXT_PUBLIC_SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9hYmF2cHBlbGloa3BvdWJnb2lxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjE4NDM2NTMsImV4cCI6MjA3NzQxOTY1M30.Al-z8UebJF2OcQUr884BiG4yBU9a2V5eqFsQgZqGb20';
+      // Persist to localStorage for app consumption
+      try {
+        localStorage.setItem('SUPABASE_URL', window.NEXT_PUBLIC_SUPABASE_URL);
+        localStorage.setItem('SUPABASE_ANON_KEY', window.NEXT_PUBLIC_SUPABASE_ANON_KEY);
+      } catch (_) {}
+    </script>
+    <script type="text/babel" data-presets="env,react">
+      try {
+      const SUPABASE_URL = (window.NEXT_PUBLIC_SUPABASE_URL || window.localStorage.getItem('SUPABASE_URL') || '');
+      const SUPABASE_ANON_KEY = (window.NEXT_PUBLIC_SUPABASE_ANON_KEY || window.localStorage.getItem('SUPABASE_ANON_KEY') || '');
+      const SUPABASE_LOADED = !!window.supabase;
+      let supabase;
+      try {
+        if (!SUPABASE_LOADED) throw new Error('Supabase UMD not loaded');
+        supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+      } catch (err) {
+        console.warn('Supabase disabled:', err);
+        // Minimal stub to avoid runtime crashes when Supabase not available
+        supabase = {
+          auth: {
+            getSession: async () => ({ data: { session: null } }),
+            onAuthStateChange: () => ({ data: { subscription: { unsubscribe: () => {} } } }),
+            signInWithPassword: async () => ({ error: { message: 'Supabase client not available' } }),
+            signUp: async () => ({ error: { message: 'Supabase client not available' } }),
+            signOut: async () => ({})
+          }
+        };
+      }
+
+      function FullApp() {
+        const [session, setSession] = React.useState(null);
+        const [email, setEmail] = React.useState('');
+        const [password, setPassword] = React.useState('');
+        const [team, setTeam] = React.useState('bulls');
+        const [report, setReport] = React.useState(null);
+        const [analysis, setAnalysis] = React.useState(null);
+        const [reports, setReports] = React.useState([]);
+        const [loading, setLoading] = React.useState(false);
+        const [error, setError] = React.useState(null);
+        const [saveMsg, setSaveMsg] = React.useState(null);
+        // Filters for saved reports
+        const [teamFilter, setTeamFilter] = React.useState('');
+        const [dateFrom, setDateFrom] = React.useState('');
+        const [dateTo, setDateTo] = React.useState('');
+        const chartRef = React.useRef(null);
+        const [chartObj, setChartObj] = React.useState(null);
+
+        React.useEffect(() => {
+          const getSession = async () => {
+            const { data: { session } } = await supabase.auth.getSession();
+            setSession(session);
+          };
+          getSession();
+          
+          const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, newSession) => {
+            setSession(newSession);
+          });
+          
+          return () => subscription?.unsubscribe();
+        }, []);
+
+        React.useEffect(() => {
+          // Update chart when report changes
+          if (report && report.results && report.results.length && chartRef.current) {
+            const labels = report.results.map(r => r.date);
+            const pointsFor = report.results.map(r => parseInt(r.team_points));
+            const pointsAgainst = report.results.map(r => parseInt(r.opp_points));
+            if (chartObj) chartObj.destroy();
+            const ctx = chartRef.current.getContext('2d');
+            const newChart = new Chart(ctx, {
+              type: 'line',
+              data: {
+                labels,
+                datasets: [
+                  {
+                    label: 'Points Scored',
+                    data: pointsFor,
+                    borderColor: 'rgb(75, 192, 192)',
+                    tension: 0.1
+                  },
+                  {
+                    label: 'Points Allowed',
+                    data: pointsAgainst,
+                    borderColor: 'rgb(255, 99, 132)',
+                    tension: 0.1
+                  }
+                ]
+              },
+              options: {
+                responsive: true,
+                plugins: { legend: { position: 'top' }, title: { display: true, text: 'Team Performance' } }
+              }
+            });
+            setChartObj(newChart);
+          }
+        }, [report]);
+
+        const signIn = async () => {
+          setError(null);
+          const { error } = await supabase.auth.signInWithPassword({ email, password });
+          if (error) setError(error.message);
+        };
+        const signUp = async () => {
+          setError(null);
+          const { error } = await supabase.auth.signUp({ email, password });
+          if (error) setError(error.message);
+        };
+        const signOut = async () => { await supabase.auth.signOut(); };
+        const generateReport = async () => {
+          setLoading(true);
+          setError(null);
+          setReport(null);
+          setAnalysis(null);
+          setSaveMsg(null);
+          try {
+            // Use API-first endpoint
+            const res = await fetch(`/api/report_bdl?team=${encodeURIComponent(team)}`, {
+              headers: session ? { 'Authorization': `Bearer ${session.access_token}` } : {}
+            });
+            if (!res.ok) {
+              const txt = await res.text();
+              throw new Error(`Błąd pobrania raportu (${res.status}): ${txt}`);
+            }
+            const data = await res.json();
+            setReport(data);
+          } catch (err) { setError(err.toString()); }
+          finally { setLoading(false); }
+        };
+
+        const saveReport = async () => {
+          if (!report) return;
+          setLoading(true);
+          setError(null);
+          setSaveMsg(null);
+          try {
+            const res = await fetch(`/api/report/${team}?save=true`, {
+              headers: session ? { 'Authorization': `Bearer ${session.access_token}` } : {}
+            });
+            if (res.ok) setSaveMsg('Raport zapisany!');
+            else setSaveMsg('Nie udało się zapisać raportu');
+          } catch (err) {
+            setSaveMsg('Błąd zapisu: ' + err.toString());
+          } finally {
+            setLoading(false);
+          }
+        };
+        const runAnalysis = async () => {
+          setLoading(true);
+          setError(null);
+          setAnalysis(null);
+          try {
+            // Analysis endpoint is disabled in API-first mode
+            const res = await fetch(`/api/analysis/${team}`, {
+              headers: session ? { 'Authorization': `Bearer ${session.access_token}` } : {}
+            });
+            if (!res.ok) {
+              setAnalysis({ error: 'Endpoint disabled in API-first mode.' });
+            } else {
+              const data = await res.json();
+              setAnalysis(data);
+            }
+          } catch (err) { setError(err.toString()); }
+          finally { setLoading(false); }
+        };
+        const fetchReports = async () => {
+          setLoading(true);
+          setError(null);
+          try {
+            // Build query string from filters
+            let qs = [];
+            if (teamFilter) qs.push(`team=${encodeURIComponent(teamFilter)}`);
+            if (dateFrom) qs.push(`from=${encodeURIComponent(dateFrom)}`);
+            if (dateTo) qs.push(`to=${encodeURIComponent(dateTo)}`);
+            const queryString = qs.length ? `?${qs.join('&')}` : '';
+            const res = await fetch(`/api/reports${queryString}`, {
+              headers: session ? { 'Authorization': `Bearer ${session.access_token}` } : {}
+            });
+            const data = await res.json();
+            setReports(data);
+          } catch (err) { setError(err.toString()); }
+          finally { setLoading(false); }
+        };
+
+        const manualRefresh = async () => {
+          setLoading(true);
+          setError(null);
+          try {
+            const res = await fetch(`/api/refresh/${team}`, {
+              headers: session ? { 'Authorization': `Bearer ${session.access_token}` } : {}
+            });
+            if (!res.ok) {
+              setSaveMsg('Odświeżanie wyłączone w trybie API-first.');
+            } else {
+              const data = await res.json();
+              setSaveMsg(`Odświeżono dane dla ${data.team}. Zapisano: ${data.report_saved}`);
+            }
+          } catch (err) {
+            setError(err.toString());
+          } finally {
+            setLoading(false);
+          }
+        };
+        const teamOptions = [
+          // Atlantic Division
+          { value: 'celtics', label: 'Boston Celtics' },
+          { value: 'nets', label: 'Brooklyn Nets' },
+          { value: 'knicks', label: 'New York Knicks' },
+          { value: '76ers', label: 'Philadelphia 76ers' },
+          { value: 'raptors', label: 'Toronto Raptors' },
+          
+          // Central Division
+          { value: 'bulls', label: 'Chicago Bulls' },
+          { value: 'cavaliers', label: 'Cleveland Cavaliers' },
+          { value: 'pistons', label: 'Detroit Pistons' },
+          { value: 'pacers', label: 'Indiana Pacers' },
+          { value: 'bucks', label: 'Milwaukee Bucks' },
+          
+          // Southeast Division
+          { value: 'hawks', label: 'Atlanta Hawks' },
+          { value: 'hornets', label: 'Charlotte Hornets' },
+          { value: 'heat', label: 'Miami Heat' },
+          { value: 'magic', label: 'Orlando Magic' },
+          { value: 'wizards', label: 'Washington Wizards' },
+          
+          // Northwest Division
+          { value: 'nuggets', label: 'Denver Nuggets' },
+          { value: 'timberwolves', label: 'Minnesota Timberwolves' },
+          { value: 'thunder', label: 'Oklahoma City Thunder' },
+          { value: 'trail-blazers', label: 'Portland Trail Blazers' },
+          { value: 'jazz', label: 'Utah Jazz' },
+          
+          // Pacific Division
+          { value: 'warriors', label: 'Golden State Warriors' },
+          { value: 'clippers', label: 'LA Clippers' },
+          { value: 'lakers', label: 'Los Angeles Lakers' },
+          { value: 'suns', label: 'Phoenix Suns' },
+          { value: 'kings', label: 'Sacramento Kings' },
+          
+          // Southwest Division
+          { value: 'mavericks', label: 'Dallas Mavericks' },
+          { value: 'rockets', label: 'Houston Rockets' },
+          { value: 'grizzlies', label: 'Memphis Grizzlies' },
+          { value: 'pelicans', label: 'New Orleans Pelicans' },
+          { value: 'spurs', label: 'San Antonio Spurs' }
+        ];
+        return (
+          <div>
+            <h1>NBA Analysis Full</h1>
+            {!SUPABASE_URL && (<p style={{ color: 'red' }}>⚠️ Ustaw SUPABASE_URL i SUPABASE_ANON_KEY w localStorage.</p>)}
+            {!SUPABASE_LOADED && (<p style={{ color: 'red' }}>⚠️ Biblioteka Supabase (CDN) nie została załadowana. Logowanie i zapisy nie będą działać.</p>)}
+            {session ? (
+              <div>
+                <p>Zalogowany jako {session.user.email}</p>
+                <button onClick={signOut}>Wyloguj</button>
+              </div>
+            ) : (
+              <div>
+                <input type="email" placeholder="Email" value={email} onChange={e => setEmail(e.target.value)} />
+                <input type="password" placeholder="Hasło" value={password} onChange={e => setPassword(e.target.value)} />
+                <button onClick={signIn}>Zaloguj</button>
+                <button onClick={signUp}>Rejestruj</button>
+                {error && <p style={{ color: 'red' }}>{error}</p>}
+              </div>
+            )}
+            <hr />
+            <div>
+              <select value={team} onChange={e => setTeam(e.target.value)}>
+                {teamOptions.map(t => (
+                  <option key={t.value} value={t.value}>{t.label}</option>
+                ))}
+              </select>
+              <button onClick={generateReport}>Pobierz raport</button>
+              <button onClick={runAnalysis}>Analizuj</button>
+              <button onClick={fetchReports}>Moje raporty</button>
+              <button onClick={manualRefresh}>Odśwież dane</button>
+            </div>
+            {loading && <p>Ładuję…</p>}
+            {report && (
+              <div>
+                <h2>Raport</h2>
+                {/* Przyjazne przedstawienie danych */}
+                <h3>Drużyna: {report.team}</h3>
+                {/* Tabela wyników meczu */}
+                {report.results && report.results.length > 0 && (
+                  <div>
+                    <h4>Wyniki meczów</h4>
+                    <table border="1" cellPadding="4" style={{ borderCollapse: 'collapse' }}>
+                      <thead>
+                        <tr>
+                          <th>Data</th><th>Przeciwnik</th><th>Dom/Wyjazd</th><th>Wynik</th><th>Punkty zdob.</th><th>Punkty strac.</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {report.results.map((r, idx) => (
+                          <tr key={idx}>
+                            <td>{r.date}</td>
+                            <td>{r.opponent}</td>
+                            <td>{r.home ? 'Dom' : 'Wyjazd'}</td>
+                            <td>{r.result}</td>
+                            <td>{r.team_points}</td>
+                            <td>{r.opp_points}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+                {/* Tabela linii bukmacherskich */}
+                {report.lines && report.lines.length > 0 && (
+                  <div>
+                    <h4>Linie bukmacherskie (closing)</h4>
+                    <table border="1" cellPadding="4" style={{ borderCollapse: 'collapse' }}>
+                      <thead>
+                        <tr>
+                          <th>Data</th><th>Przeciwnik</th><th>Spread</th><th>Total</th><th>Wynik końcowy</th><th>ATS</th><th>O/U</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {report.lines.map((l, idx) => (
+                          <tr key={idx}>
+                            <td>{l.date}</td>
+                            <td>{l.opponent}</td>
+                            <td>{l.spread}</td>
+                            <td>{l.total}</td>
+                            <td>{l.final_score}</td>
+                            <td>{l.ats}</td>
+                            <td>{l.ou}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+                {/* Lista kontuzjowanych */}
+                {report.injuries && report.injuries.length > 0 && (
+                  <div>
+                    <h4>Kontuzje</h4>
+                    <ul>
+                      {report.injuries.map((inj, idx) => (
+                        <li key={idx}>{inj.player} – {inj.status}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {/* Wykres */}
+                <div className="chart-container">
+                  <canvas ref={chartRef}></canvas>
+                </div>
+                {/* Zapisywanie raportu */}
+                {session && (
+                  <div>
+                    <button onClick={saveReport}>Zapisz raport</button>
+                    {saveMsg && <p>{saveMsg}</p>}
+                  </div>
+                )}
+              </div>
+            )}
+                {analysis && (
+              <div>
+                <h2>Analiza</h2>
+                <pre>{JSON.stringify(analysis, null, 2)}</pre>
+                <h3>Parlay suggestions</h3>
+                <ul>
+                  {Array.isArray(analysis?.parlay_suggestions) && analysis.parlay_suggestions.map((leg, idx) => (
+                    <li key={idx}>{leg.type} – {leg.bet} ({leg.confidence}): {leg.note}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {reports && reports.length > 0 && (
+              <div>
+                <h2>Moje zapisane raporty</h2>
+                {/* Filters */}
+                <div style={{ marginBottom: '0.5rem' }}>
+                  <label>
+                    Drużyna:
+                    <select value={teamFilter} onChange={e => setTeamFilter(e.target.value)}>
+                      <option value="">– wszystkie –</option>
+                      {teamOptions.map(t => (
+                        <option key={t.value} value={t.value}>{t.label}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    Od: <input type="date" value={dateFrom} onChange={e => setDateFrom(e.target.value)} />
+                  </label>
+                    <label>
+                    Do: <input type="date" value={dateTo} onChange={e => setDateTo(e.target.value)} />
+                  </label>
+                  <button onClick={fetchReports}>Filtruj</button>
+                </div>
+                {reports.map((r, idx) => (
+                  <pre key={idx}>{JSON.stringify(r, null, 2)}</pre>
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      }
+      (function() {
+        const container = document.getElementById('root');
+        if (ReactDOM && typeof ReactDOM.createRoot === 'function') {
+          const root = ReactDOM.createRoot(container);
+          root.render(<FullApp />);
+        } else if (ReactDOM && typeof ReactDOM.render === 'function') {
+          // Fallback for older React DOM versions
+          ReactDOM.render(<FullApp />, container);
+        } else {
+          const pre = document.createElement('pre');
+          pre.textContent = 'React DOM nie jest dostępny.';
+          document.body.prepend(pre);
+        }
+      })();
+      } catch (e) {
+        const pre = document.createElement('pre');
+        pre.style.background = '#ffefef';
+        pre.style.color = '#b00020';
+        pre.style.padding = '8px';
+        pre.style.border = '1px solid #b00020';
+        pre.textContent = 'Błąd inicjalizacji aplikacji: ' + (e.message || String(e));
+        document.body.prepend(pre);
+        console.error(e);
+      }
+    </script>
+  </body>
+</html>
