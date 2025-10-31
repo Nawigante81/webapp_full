@@ -1,6 +1,9 @@
 import os
 from typing import Any, Dict, List
+from dotenv import load_dotenv
 from clients import get_client, fetch
+
+load_dotenv()
 
 BASE = "https://api.the-odds-api.com/v4/sports/basketball_nba/odds"
 KEY = os.getenv("ODDS_API_KEY")

@@ -11,7 +11,7 @@ UAS = [
 
 def get_client() -> httpx.Client:
     return httpx.Client(
-        http2=True,
+        http2=False,
         timeout=20.0,
         follow_redirects=True,
         headers={
@@ -38,6 +38,22 @@ def fetch(
             # gentle throttle
             time.sleep(0.4 + random.random() * 0.6)
             return r.json()
+        except httpx.HTTPStatusError as e:
+            # Don't retry on 401 Unauthorized - it won't succeed
+            if e.response.status_code == 401:
+                raise
+            # Handle rate limiting: respect Retry-After when 429
+            if e.response.status_code == 429:
+                ra = e.response.headers.get("Retry-After")
+                try:
+                    wait = float(ra)
+                except (TypeError, ValueError):
+                    wait = base * (2 ** (i - 1))
+                time.sleep(wait)
+                continue
+            if i == tries:
+                raise
+            time.sleep(base * (2 ** (i - 1)) * (0.7 + random.random() * 0.6))
         except httpx.HTTPError:
             if i == tries:
                 raise

@@ -243,24 +243,127 @@ class FullHandler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(reports).encode('utf-8'))
 
     def handle_analysis(self, team: str):
-        # Deprecated: analysis previously used legacy scraping report. Consider rebuilding on /report data.
-        self.send_response(410)
+        # API-first analysis: build a compatible report from BDL + injuries + historical odds
+        slug, br = _resolve_br_abbr(team)
+        # Resolve team via BDL
+        team_obj = bdl_team_lookup(slug) or bdl_team_lookup(br)
+        if not team_obj:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "team_not_found"}).encode('utf-8'))
+            return
+        team_id = team_obj.get('id')
+        season = DEFAULT_NBA_SEASON
+        # Fetch games and injuries from BDL
+        games_resp = bdl_games_by_team(team_id, season=season)
+        games = games_resp.get('data', []) if isinstance(games_resp, dict) else []
+        injuries_resp = bdl_injuries_by_team(team_id)
+        injuries_bdl = injuries_resp.get('data', []) if isinstance(injuries_resp, dict) else []
+
+        # Transform BDL games to legacy 'results' shape expected by analysis
+        results = []
+        for g in games:
+            try:
+                home_team = g.get('home_team') or {}
+                visitor_team = g.get('visitor_team') or {}
+                is_home = (home_team.get('id') == team_id)
+                team_pts = int(g.get('home_team_score') or 0) if is_home else int(g.get('visitor_team_score') or 0)
+                opp_pts = int(g.get('visitor_team_score') or 0) if is_home else int(g.get('home_team_score') or 0)
+                opp_abbr = (visitor_team.get('abbreviation') if is_home else home_team.get('abbreviation')) or \
+                            (visitor_team.get('name') if is_home else home_team.get('name')) or ''
+                result = 'W' if team_pts > opp_pts else 'L'
+                date_iso = g.get('date') or ''
+                date_short = date_iso.split('T')[0] if isinstance(date_iso, str) else ''
+                results.append({
+                    'date': date_short,
+                    'opponent': opp_abbr,
+                    'home': bool(is_home),
+                    'result': result,
+                    'team_points': str(team_pts),
+                    'opp_points': str(opp_pts),
+                })
+            except Exception:
+                continue
+
+        # Fetch historical odds from Supabase for ATS/O-U rates
+        lines = []
+        if SUPABASE_URL and SUPABASE_SERVICE_KEY:
+            try:
+                from supabase_client import get_supabase_client
+                sb = get_supabase_client()
+                if sb:
+                    odds_resp = sb.table('games_odds').select('*').eq('team_abbr', br).order('game_date', desc=True).limit(20).execute()
+                    odds_rows = odds_resp.data if hasattr(odds_resp, 'data') else []
+                    for row in odds_rows:
+                        lines.append({
+                            'date': row.get('game_date', ''),
+                            'opponent': row.get('opponent_abbr', ''),
+                            'spread': str(row.get('spread_line', '')),
+                            'total': str(row.get('total_line', '')),
+                            'final_score': f"{row.get('team_score', '')}-{row.get('opp_score', '')}",
+                            'ats': row.get('ats_result', ''),
+                            'ou': row.get('ou_result', ''),
+                        })
+            except Exception as e:
+                logger.warning(f"Could not fetch historical odds: {e}")
+
+        # Transform injuries to simple list with player/status
+        injuries = []
+        for it in injuries_bdl:
+            try:
+                p = it.get('player') or {}
+                name = (f"{p.get('first_name','')} {p.get('last_name','')}").strip() or \
+                       p.get('full_name') or p.get('name') or p.get('display_name') or 'Unknown'
+                status = it.get('status') or it.get('injury_status') or it.get('description') or it.get('comment') or ''
+                injuries.append({'player': name, 'status': status})
+            except Exception:
+                continue
+
+        # Build synthetic report compatible with analysis module
+        report = {
+            'team': br,
+            'results': results,
+            'lines': lines,
+            'injuries': injuries,
+        }
+        metrics = calculate_basic_metrics(report)
+        rates = calculate_ats_ou_rates(report)
+        suggestions = generate_parlay_suggestions(report)
+        analysis_data = {
+            'team': slug,
+            'metrics': metrics,
+            'rates': rates,
+            'parlay_suggestions': suggestions,
+        }
+        self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.end_headers()
-        self.wfile.write(json.dumps({
-            'error': 'deprecated',
-            'message': 'Analysis endpoint is disabled in API-first mode.'
-        }).encode('utf-8'))
+        self.wfile.write(json.dumps(analysis_data).encode('utf-8'))
 
     def handle_refresh(self, team: str):
-        # Deprecated: refresh relied on legacy pipelines. Use ETL script or API-first endpoints.
-        self.send_response(410)
-        self.send_header('Content-Type', 'application/json')
-        self.end_headers()
-        self.wfile.write(json.dumps({
-            'error': 'deprecated',
-            'message': 'Refresh is disabled in API-first mode.'
-        }).encode('utf-8'))
+        """Manual refresh: run ETL to ingest odds history for a team."""
+        slug, br = _resolve_br_abbr(team)
+        logger.info(f"Refreshing odds data for team input='{team}', resolved slug='{slug}', br='{br}'")
+        try:
+            from odds_etl import ingest_odds_for_team
+            ingest_odds_for_team(br, days=30)
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                'status': 'refreshed',
+                'team': slug,
+                'message': 'Historical odds ingested for last 30 days.'
+            }).encode('utf-8'))
+        except Exception as e:
+            logger.error(f"Refresh error: {e}")
+            self.send_response(500)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                'error': 'refresh_failed',
+                'message': str(e)
+            }).encode('utf-8'))
 
     def handle_player_stats(self, game_id: str):
         """Return per-player statistics for a game via API-NBA provider."""

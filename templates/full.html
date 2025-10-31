@@ -109,12 +109,44 @@
           return () => subscription?.unsubscribe();
         }, []);
 
+        // Helper: compute unified results from legacy or BDL shape
+        const computeResults = React.useCallback((rep) => {
+          if (!rep) return [];
+          if (Array.isArray(rep.results) && rep.results.length) return rep.results;
+          const games = Array.isArray(rep.games) ? rep.games : [];
+          const teamId = rep.team && typeof rep.team === 'object' ? rep.team.id : null;
+          const out = [];
+          for (const g of games) {
+            try {
+              const home = g.home_team || {};
+              const away = g.visitor_team || {};
+              const isHome = teamId ? (home.id === teamId) : false;
+              const teamPts = isHome ? (g.home_team_score || 0) : (g.visitor_team_score || 0);
+              const oppPts = isHome ? (g.visitor_team_score || 0) : (g.home_team_score || 0);
+              const opp = isHome ? (away.abbreviation || away.name || '') : (home.abbreviation || home.name || '');
+              const res = Number(teamPts) > Number(oppPts) ? 'W' : 'L';
+              const dateIso = g.date || '';
+              const dateShort = typeof dateIso === 'string' && dateIso.includes('T') ? dateIso.split('T')[0] : (dateIso || '');
+              out.push({
+                date: dateShort,
+                opponent: opp,
+                home: !!isHome,
+                result: res,
+                team_points: String(teamPts ?? ''),
+                opp_points: String(oppPts ?? ''),
+              });
+            } catch (_) { /* ignore row */ }
+          }
+          return out;
+        }, []);
+
         React.useEffect(() => {
-          // Update chart when report changes
-          if (report && report.results && report.results.length && chartRef.current) {
-            const labels = report.results.map(r => r.date);
-            const pointsFor = report.results.map(r => parseInt(r.team_points));
-            const pointsAgainst = report.results.map(r => parseInt(r.opp_points));
+          // Update chart when report changes (supports BDL shape)
+          const results = computeResults(report);
+          if (results && results.length && chartRef.current) {
+            const labels = results.map(r => r.date);
+            const pointsFor = results.map(r => parseInt(r.team_points));
+            const pointsAgainst = results.map(r => parseInt(r.opp_points));
             if (chartObj) chartObj.destroy();
             const ctx = chartRef.current.getContext('2d');
             const newChart = new Chart(ctx, {
@@ -122,24 +154,11 @@
               data: {
                 labels,
                 datasets: [
-                  {
-                    label: 'Points Scored',
-                    data: pointsFor,
-                    borderColor: 'rgb(75, 192, 192)',
-                    tension: 0.1
-                  },
-                  {
-                    label: 'Points Allowed',
-                    data: pointsAgainst,
-                    borderColor: 'rgb(255, 99, 132)',
-                    tension: 0.1
-                  }
+                  { label: 'Points Scored', data: pointsFor, borderColor: 'rgb(75, 192, 192)', tension: 0.1 },
+                  { label: 'Points Allowed', data: pointsAgainst, borderColor: 'rgb(255, 99, 132)', tension: 0.1 }
                 ]
               },
-              options: {
-                responsive: true,
-                plugins: { legend: { position: 'top' }, title: { display: true, text: 'Team Performance' } }
-              }
+              options: { responsive: true, plugins: { legend: { position: 'top' }, title: { display: true, text: 'Team Performance' } } }
             });
             setChartObj(newChart);
           }
@@ -239,10 +258,11 @@
               headers: session ? { 'Authorization': `Bearer ${session.access_token}` } : {}
             });
             if (!res.ok) {
-              setSaveMsg('Odświeżanie wyłączone w trybie API-first.');
+              const errData = await res.json();
+              setSaveMsg(`Błąd odświeżania: ${errData.message || res.statusText}`);
             } else {
               const data = await res.json();
-              setSaveMsg(`Odświeżono dane dla ${data.team}. Zapisano: ${data.report_saved}`);
+              setSaveMsg(`${data.message || 'Odświeżono dane'} dla ${data.team}.`);
             }
           } catch (err) {
             setError(err.toString());
@@ -329,9 +349,11 @@
               <div>
                 <h2>Raport</h2>
                 {/* Przyjazne przedstawienie danych */}
-                <h3>Drużyna: {report.team}</h3>
+                <h3>
+                  Drużyna: {typeof report.team === 'object' ? (report.team.abbreviation || report.team.name || report.team.city || '—') : (report.team || '—')}
+                </h3>
                 {/* Tabela wyników meczu */}
-                {report.results && report.results.length > 0 && (
+                {(() => { const results = computeResults(report); return (results && results.length > 0); })() && (
                   <div>
                     <h4>Wyniki meczów</h4>
                     <table border="1" cellPadding="4" style={{ borderCollapse: 'collapse' }}>
@@ -341,7 +363,7 @@
                         </tr>
                       </thead>
                       <tbody>
-                        {report.results.map((r, idx) => (
+                        {computeResults(report).map((r, idx) => (
                           <tr key={idx}>
                             <td>{r.date}</td>
                             <td>{r.opponent}</td>
@@ -381,14 +403,66 @@
                     </table>
                   </div>
                 )}
+                {/* Kursy na nadchodzące mecze (The Odds API) */}
+                {Array.isArray(report?.odds) && report.odds.length > 0 && (
+                  <div>
+                    <h4>Kursy na nadchodzące mecze</h4>
+                    <table border="1" cellPadding="4" style={{ borderCollapse: 'collapse' }}>
+                      <thead>
+                        <tr>
+                          <th>Data</th><th>Mecz</th><th>H2H Home</th><th>H2H Away</th><th>Spread Home</th><th>Total</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {report.odds.map((ev, idx) => {
+                          const date = ev.commence_time ? new Date(ev.commence_time).toLocaleString('pl-PL') : '';
+                          const matchup = `${ev.home_team || ''} vs ${ev.away_team || ''}`;
+                          let h2hHome = '', h2hAway = '', spreadHome = '', total = '';
+                          const bms = ev.bookmakers || [];
+                          if (bms.length) {
+                            const mkts = bms[0].markets || [];
+                            for (const m of mkts) {
+                              if (m.key === 'h2h') {
+                                const outs = m.outcomes || [];
+                                h2hHome = outs.find(o => o.name === ev.home_team)?.price || '';
+                                h2hAway = outs.find(o => o.name === ev.away_team)?.price || '';
+                              } else if (m.key === 'spreads') {
+                                const outs = m.outcomes || [];
+                                const homeOut = outs.find(o => o.name === ev.home_team);
+                                spreadHome = homeOut ? `${homeOut.point} (${homeOut.price})` : '';
+                              } else if (m.key === 'totals') {
+                                const outs = m.outcomes || [];
+                                const over = outs.find(o => o.name?.toLowerCase().includes('over'));
+                                total = over ? `${over.point}` : '';
+                              }
+                            }
+                          }
+                          return (
+                            <tr key={idx}>
+                              <td>{date}</td>
+                              <td>{matchup}</td>
+                              <td>{h2hHome}</td>
+                              <td>{h2hAway}</td>
+                              <td>{spreadHome}</td>
+                              <td>{total}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
                 {/* Lista kontuzjowanych */}
-                {report.injuries && report.injuries.length > 0 && (
+                {Array.isArray(report?.injuries) && report.injuries.length > 0 && (
                   <div>
                     <h4>Kontuzje</h4>
                     <ul>
-                      {report.injuries.map((inj, idx) => (
-                        <li key={idx}>{inj.player} – {inj.status}</li>
-                      ))}
+                      {report.injuries.map((inj, idx) => {
+                        const p = inj && inj.player;
+                        const name = typeof p === 'string' ? p : ((p && ((p.first_name || '') + ' ' + (p.last_name || '')).trim()) || p?.full_name || p?.name || 'Nieznany');
+                        const status = inj?.status || inj?.injury_status || inj?.description || inj?.comment || '';
+                        return (<li key={idx}>{name} – {status}</li>);
+                      })}
                     </ul>
                   </div>
                 )}
